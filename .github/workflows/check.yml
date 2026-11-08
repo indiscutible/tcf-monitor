@@ -1,0 +1,67 @@
+name: TCF slot check
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a test push"
+        type: boolean
+        default: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: .state
+          key: tcf-${{ github.run_id }}
+          restore-keys: tcf-
+      - name: Check
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST: ${{ github.event.inputs.test }}
+        run: |
+          python3 - <<'PY'
+          import os, re, json, html, urllib.request
+          from pathlib import Path
+          URL = "https://www.afcalgary.ca/exams/tcf/registration-process/"
+          TOPIC = os.environ["NTFY_TOPIC"]
+
+          def push(msg):
+              urllib.request.urlopen(urllib.request.Request(
+                  "https://ntfy.sh/" + TOPIC, data=msg.encode(), method="POST",
+                  headers={"Title": "TCF Calgary slot alert", "Priority": "urgent",
+                           "Tags": "rotating_light", "Click": URL}), timeout=30)
+
+          def parse(text):
+              text = re.sub(r"<(script|style)[\s\S]*?</\1>", " ", text, flags=re.I)
+              text = re.sub(r"<[^>]+>", " ", text)
+              text = re.sub(r"\s+", " ", html.unescape(text))
+              ms = list(re.finditer(r"([A-Za-z]+ 20\d\d) sessions", text, re.I))
+              out = {}
+              for i, m in enumerate(ms):
+                  end = ms[i + 1].start() if i + 1 < len(ms) else len(text)
+                  seg = re.split(r"IMPORTANT|Step 3", text[m.end():end])[0]
+                  out[m.group(1).title()] = "sold out" not in seg.lower()
+              return out
+
+          if os.environ.get("TEST") == "true":
+              push("Test alert: your TCF monitor works.")
+              raise SystemExit
+          req = urllib.request.Request(URL, headers={"User-Agent": "Mozilla/5.0 (personal availability checker)"})
+          cur = parse(urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "ignore"))
+          print("current:", cur)
+          if not cur:
+              raise SystemExit("No session blocks found - page layout may have changed")
+          sf = Path(".state/s.json"); sf.parent.mkdir(exist_ok=True)
+          prev = json.loads(sf.read_text()) if sf.exists() else None
+          opened = [k for k, v in cur.items() if v and not (prev or {}).get(k)]
+          added = [k for k in cur if prev is not None and k not in prev]
+          if opened:
+              push("OPEN: " + ", ".join(opened) + ". Book now!")
+          elif added:
+              push("New session listed: " + ", ".join(added) + " (currently sold out)")
+          sf.write_text(json.dumps(cur))
+          PY
